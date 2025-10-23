@@ -1,1 +1,34 @@
-aaaaaaaaa
+# ir_log_simple.py
+import RPi.GPIO as GPIO
+import time
+from datetime import datetime
+
+IR_RX_PIN = 17  # TSOPのOUT
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(IR_RX_PIN, GPIO.IN)  # TSOPは内部回路あり：基本プル不要
+
+last_log_time = 0
+
+def on_edge(channel):
+    global last_log_time
+    now = time.time()
+    # 連続で大量に来るので、短いクールダウンでログを間引く
+    if now - last_log_time > 0.2:
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[{ts}] IR detected")
+        last_log_time = now
+
+# TSOPは受信でLOWになる → FALLINGエッジを拾う
+GPIO.add_event_detect(IR_RX_PIN, GPIO.FALLING, callback=on_edge, bouncetime=5)
+
+print("IR受信ログ開始（Ctrl+Cで終了）")
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    pass
+finally:
+    GPIO.cleanup()
+    print("GPIO cleaned up.")
+
