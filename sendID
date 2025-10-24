@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import smbus
+import time
+import pigpio
+
+# ---- ADC (ADS7830) ----
+I2C_BUS = 1
+I2C_ADDR = 0x4B
+CMD_CH0 = 0x84  # AIN0
+
+# ---- IR transmitter ----
+IR_PIN = 17          # GPIO17 (software PWM)
+CARRIER = 38000      # Hz
+DUTY = 128           # 0..255 (~50%)
+ID_VALUE = 1327      # your 4-digit ID
+
+# ---- joystick / trigger ----
+PERIOD_S = 0.5
+DEADZONE = 0
+
+# ---- NEC-like timings (microseconds) ----
+T_LEAD_MARK = 9000
+T_LEAD_SPACE = 4500
+T_MARK = 560
+T_SPACE_0 = 560
+T_SPACE_1 = 1690
+T_TRAIL = 560
+
+# ---- init ----
+bus = smbus.SMBus(I2C_BUS)
+pi = pigpio.pi()
+if not pi.connected:
+    raise SystemExit("Start pigpiod first: sudo systemctl start pigpiod")
+
+pi.set_mode(IR_PIN, pigpio.OUTPUT)
+pi.set_PWM_frequency(IR_PIN, CARRIER)
+pi.set_PWM_dutycycle(IR_PIN, 0)
+
+def read_adc(cmd: int):
+    try:
+        bus.write_byte(I2C_ADDR, cmd)
+        return bus.read_byte(I2C_ADDR)
+    except OSError:
+        return None
+
+# ---- IR send helpers ----
+def mark(us):
+    pi.set_PWM_dutycycle(IR_PIN, DUTY)
+    time.sleep(us / 1_000_000.0)
+    pi.set_PWM_dutycycle(IR_PIN, 0)
+
+def space(us):
+    time.sleep(us / 1_000_000.0)
+
+def send_bit(b):
+    mark(T_MARK)
+    space(T_SPACE_1 if b else T_SPACE_0)
+
+def send_frame(id_value: int):
+    bits = format(id_value, "014b")  # 14-bit binary string
+    mark(T_LEAD_MARK)
+    space(T_LEAD_SPACE)
+    for b in bits:
+        send_bit(int(b))
+    mark(T_TRAIL)
+
+# ---- main ----
+def fire_id():
+    t_end = time.time() + 1.0  # send for 1 second
+    while time.time() < t_end:
+        send_frame(ID_VALUE)
+        time.sleep(0.06)  # 60 ms gap between frames
+
+def main():
+    last = 0
+    next_t = time.monotonic()
+    try:
+        while True:
+            x_raw = read_adc(CMD_CH0)
+            if x_raw is None:
+                curr = 0
+            else:
+                x_pos = x_raw - 128
+                curr = 1 if (x_pos < 0 and abs(x_pos) > DEADZONE) else 0
+
+            # rising edge trigger
+            if last == 0 and curr == 1:
+                print("Trigger detected, sending ID:", ID_VALUE)
+                fire_id()
+
+            print(curr, flush=True)
+            last = curr
+
+            next_t += PERIOD_S
+            delay = next_t - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_t = time.monotonic()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pi.set_PWM_dutycycle(IR_PIN, 0)
+        pi.stop()
+
+if __name__ == "__main__":
+    main()
+
