@@ -1,34 +1,82 @@
-# ir_log_simple.py
-import RPi.GPIO as GPIO
-import time
-from datetime import datetime
+#!/usr/bin/env python3
+import pigpio, time
 
-IR_RX_PIN = 17  # TSOPのOUT
+PIN_RX = 24
+PIN_BUZ = 17
 
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(IR_RX_PIN, GPIO.IN)  # TSOPは内部回路あり：基本プル不要
+TOL = 0.4
+T_LEAD_SPACE = 5300
+T_MARK = 800
+T_SPACE_0 = 1200
+T_SPACE_1 = 2400
+BIT_COUNT = 14
 
-last_log_time = 0
+pi = pigpio.pi()
+if not pi.connected:
+    raise SystemExit("start pigpiod first")
 
-def on_edge(channel):
-    global last_log_time
-    now = time.time()
-    # 連続で大量に来るので、短いクールダウンでログを間引く
-    if now - last_log_time > 0.2:
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        print(f"[{ts}] IR detected")
-        last_log_time = now
+pi.set_mode(PIN_RX, pigpio.INPUT)
+pi.set_pull_up_down(PIN_RX, pigpio.PUD_UP)
+pi.set_mode(PIN_BUZ, pigpio.OUTPUT)
+pi.write(PIN_BUZ, 0)
 
-# TSOPは受信でLOWになる → FALLINGエッジを拾う
-GPIO.add_event_detect(IR_RX_PIN, GPIO.FALLING, callback=on_edge, bouncetime=5)
+def near(v, t): return abs(v - t) <= t * TOL
+def beep(sec=0.1): pi.write(PIN_BUZ, 1); time.sleep(sec); pi.write(PIN_BUZ, 0)
 
-print("IR受信ログ開始（Ctrl+Cで終了）")
+last_tick = None
+last_level = 1
+pulses = []
+
+def cbf(gpio, level, tick):
+    global last_tick, last_level, pulses
+    if last_tick is not None:
+        dur = pigpio.tickDiff(last_tick, tick)
+        pulses.append((last_level, dur))
+        if level == 1 and dur > 5000:
+            decode(pulses)
+            pulses.clear()
+    last_tick = tick
+    last_level = level
+
+def decode(p):
+    # skip first long leader
+    if len(p) < 10: return
+    # find the first large gap (~5300)
+    i = 0
+    while i < len(p):
+        if p[i][1] > 4000:
+            i += 1
+            break
+        i += 1
+    bits = []
+    while i + 1 < len(p) and len(bits) < BIT_COUNT:
+        lm, dm = p[i]
+        ls, ds = p[i + 1]
+        if not (lm == 0 and ls == 1):
+            i += 1
+            continue
+        if near(ds, T_SPACE_0):
+            bits.append(0)
+        elif near(ds, T_SPACE_1):
+            bits.append(1)
+        else:
+            pass
+        i += 2
+    if len(bits) >= 8:
+        val = 0
+        for b in bits:
+            val = (val << 1) | b
+        print("ID:", val, flush=True)
+        beep()
+
+cb = pi.callback(PIN_RX, pigpio.EITHER_EDGE, cbf)
+print("Listening for decoded IDs (Ctrl+C to stop)")
+
 try:
     while True:
         time.sleep(1)
 except KeyboardInterrupt:
     pass
 finally:
-    GPIO.cleanup()
-    print("GPIO cleaned up.")
-
+    cb.cancel()
+    pi.stop()
