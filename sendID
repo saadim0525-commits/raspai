@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# LCD ammo display + IR fire + Ultrasonic Reload
 
 import smbus
 import time
 import pigpio
+# sys and select are no longer needed
+from grove_rgb_lcd import setText, setRGB
 
-# ---- ADC (ADS7830) ----
 I2C_BUS = 1
 I2C_ADDR = 0x4B
-CMD_CH0 = 0x84  # AIN0
+CMD_CH0 = 0x84
 
-# ---- IR transmitter ----
-IR_PIN = 17          # GPIO17 (software PWM)
-CARRIER = 38000      # Hz
-DUTY = 128           # 0..255 (~50%)
-ID_VALUE = 1327      # your 4-digit ID
-
-# ---- joystick / trigger ----
-PERIOD_S = 0.5
+# --- IR ---
+IR_PIN = 17
+CARRIER = 38000
+DUTY = 128
+ID_VALUE = 1327
+PERIOD_S = 0.25
 DEADZONE = 0
 
-# ---- NEC-like timings (microseconds) ----
 T_LEAD_MARK = 9000
 T_LEAD_SPACE = 4500
 T_MARK = 560
@@ -28,24 +26,18 @@ T_SPACE_0 = 560
 T_SPACE_1 = 1690
 T_TRAIL = 560
 
-# ---- init ----
+# --- Ultrasonic Sensor (NEW) ---
+US_PIN = 23 # SIG pin GPIO number
+
 bus = smbus.SMBus(I2C_BUS)
 pi = pigpio.pi()
 if not pi.connected:
-    raise SystemExit("Start pigpiod first: sudo systemctl start pigpiod")
+    raise SystemExit("Start pigpiod first")
 
 pi.set_mode(IR_PIN, pigpio.OUTPUT)
 pi.set_PWM_frequency(IR_PIN, CARRIER)
 pi.set_PWM_dutycycle(IR_PIN, 0)
 
-def read_adc(cmd: int):
-    try:
-        bus.write_byte(I2C_ADDR, cmd)
-        return bus.read_byte(I2C_ADDR)
-    except OSError:
-        return None
-
-# ---- IR send helpers ----
 def mark(us):
     pi.set_PWM_dutycycle(IR_PIN, DUTY)
     time.sleep(us / 1_000_000.0)
@@ -58,53 +50,146 @@ def send_bit(b):
     mark(T_MARK)
     space(T_SPACE_1 if b else T_SPACE_0)
 
-def send_frame(id_value: int):
-    bits = format(id_value, "014b")  # 14-bit binary string
+def send_frame(id_value):
+    bits = format(id_value, "014b")
     mark(T_LEAD_MARK)
     space(T_LEAD_SPACE)
     for b in bits:
         send_bit(int(b))
     mark(T_TRAIL)
 
-# ---- main ----
 def fire_id():
-    t_end = time.time() + 1.0  # send for 1 second
+    t_end = time.time() + 0.2
     while time.time() < t_end:
         send_frame(ID_VALUE)
-        time.sleep(0.06)  # 60 ms gap between frames
+        time.sleep(0.06)
+
+def render_ammo(ammo, max_ammo=6):
+    return " ".join("O" if i < ammo else "." for i in range(max_ammo))
+
+def update_lcd(ammo, status=""):
+    line1 = render_ammo(ammo)
+    line2 = f"Ammo:{ammo}/6 {status}"
+    setRGB(0, 128, 255)
+    setText(line1[:16] + "\n" + line2[:16])
+
+# --- Ultrasonic distance function (NEW) ---
+def get_distance(pin):
+    """
+    Measure distance using a single-pin ultrasonic sensor.
+    """
+    TIMEOUT = 0.02 # Failsafe
+
+    # 1. Send trigger pulse
+    pi.set_mode(pin, pigpio.OUTPUT)
+    pi.write(pin, 0)
+    time.sleep(0.000002) # 2us
+    pi.write(pin, 1)
+    time.sleep(0.000010) # 10us
+    pi.write(pin, 0)
+
+    # 2. Switch pin to INPUT
+    pi.set_mode(pin, pigpio.INPUT)
+
+    # 3. Wait for echo start
+    start_time = time.time()
+    timeout_start = start_time
+    while pi.read(pin) == 0:
+        start_time = time.time()
+        if start_time - timeout_start > TIMEOUT:
+            return None # Timeout
+
+    # 4. Wait for echo end
+    end_time = time.time()
+    timeout_end = end_time
+    while pi.read(pin) == 1:
+        end_time = time.time()
+        if end_time - timeout_end > TIMEOUT:
+            return None # Timeout
+
+    duration = end_time - start_time
+    distance = (duration * 34300) / 2 # Speed of sound in cm/s
+    
+    return distance
 
 def main():
+    ammo = 6
+    MAX_AMMO = 6
     last = 0
     next_t = time.monotonic()
+    update_lcd(ammo, "Ready")
+
+    # --- Reload logic (MODIFIED) ---
+    magazine_in = True # Assume magazine starts loaded
+    RELOAD_THRESHOLD = 10.0 # 5cm or more = out
+    LOADED_THRESHOLD = 7.0 # 2cm or less = in
+
     try:
         while True:
-            x_raw = read_adc(CMD_CH0)
-            if x_raw is None:
-                curr = 0
-            else:
+            # --- Ultrasonic Reload (NEW) ---
+            distance = get_distance(US_PIN)
+            
+            if distance is not None:
+                # Debug print (remove if not needed)
+                # print(f"Dist: {distance:.1f} cm, Mag: {magazine_in}") 
+
+                if magazine_in and distance >= RELOAD_THRESHOLD:
+                    # 1. Magazine was pulled out
+                    magazine_in = False
+                    update_lcd(ammo, "Reloading")
+                    print("Magazine out")
+
+                elif not magazine_in and distance <= LOADED_THRESHOLD:
+                    # 2. Magazine was inserted
+                    magazine_in = True
+                    ammo = MAX_AMMO
+                    update_lcd(ammo, "Reloaded")
+                    print("Reloaded", ammo)
+            
+            # --- Trigger (ADC) Read ---
+            try:
+                bus.write_byte(I2C_ADDR, CMD_CH0)
+                x_raw = bus.read_byte(I2C_ADDR)
+            except OSError:
+                x_raw = None
+
+            curr = 0
+            if x_raw is not None:
                 x_pos = x_raw - 128
-                curr = 1 if (x_pos < 0 and abs(x_pos) > DEADZONE) else 0
+                if x_pos < 0 and abs(x_pos) > DEADZONE:
+                    curr = 1
 
-            # rising edge trigger
+            # --- Fire Logic (MODIFIED) ---
             if last == 0 and curr == 1:
-                print("Trigger detected, sending ID:", ID_VALUE)
-                fire_id()
+                if not magazine_in:
+                    # Magazine is out
+                    update_lcd(ammo, "No Mag!")
+                    print("No Magazine")
+                elif ammo > 0:
+                    # Fire
+                    ammo -= 1
+                    update_lcd(ammo, "")
+                    print("Fire", ammo)
+                    fire_id()
+                else:
+                    # Empty
+                    update_lcd(ammo, "Empty")
+                    print("Empty")
 
-            print(curr, flush=True)
             last = curr
-
             next_t += PERIOD_S
             delay = next_t - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
             else:
                 next_t = time.monotonic()
+
     except KeyboardInterrupt:
         pass
     finally:
+        setRGB(0, 0, 0)
         pi.set_PWM_dutycycle(IR_PIN, 0)
         pi.stop()
 
 if __name__ == "__main__":
     main()
-
